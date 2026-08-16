@@ -288,6 +288,28 @@ def explain_prediction(text, model, vectorizer):
     
     return real_factors, fake_factors
 
+# --- DATA PRESETS ---
+presets = {
+    "None": "",
+    "True Preset: Exoplanet Discovery": "NASA discovered a new exoplanet that may support life. The planet is 20 light years away and lies in the habitable zone of its parent star. According to researchers, the atmosphere contains signatures of water vapor and oxygen.",
+    "Fake Preset: Pope Endorsement": "BREAKING: The Pope has officially endorsed Donald Trump in the 2024 presidential election. In a shocking statement released this morning, the Vatican expressed support for his policies. Read the full statement now!",
+    "True Preset: Climate Talks": "The United Nations announced a major breakthrough in climate negotiations after seven years of stalled talks. Global leaders agreed on binding emission caps and an international fund to support green technology in developing countries.",
+    "Fake Preset: Cancer Secret": "A secret cure for cancer has been suppressed by major pharmaceutical companies, according to a whistleblower. The leak claims that inexpensive treatments have been hidden to protect corporate profits from ongoing therapy drugs."
+}
+
+# Initialize session state variables
+if "input_text" not in st.session_state:
+    st.session_state.input_text = ""
+if "selected_preset" not in st.session_state:
+    st.session_state.selected_preset = "None"
+
+def update_preset():
+    st.session_state.input_text = presets[st.session_state.selected_preset]
+
+def reset_callback():
+    st.session_state.input_text = ""
+    st.session_state.selected_preset = "None"
+
 # --- SIDEBAR WORKSPACE ---
 with st.sidebar:
     st.markdown("### ⚙️ Engine Control Center")
@@ -313,17 +335,12 @@ with st.sidebar:
     st.markdown("### ⚡ Quick Presets")
     st.markdown("Test the engine instantly using a preset sample:")
     
-    # Presets definition
-    presets = {
-        "None": "",
-        "True Preset: Exoplanet Discovery": "NASA discovered a new exoplanet that may support life. The planet is 20 light years away and lies in the habitable zone of its parent star. According to researchers, the atmosphere contains signatures of water vapor and oxygen.",
-        "Fake Preset: Pope Endorsement": "BREAKING: The Pope has officially endorsed Donald Trump in the 2024 presidential election. In a shocking statement released this morning, the Vatican expressed support for his policies. Read the full statement now!",
-        "True Preset: Climate Talks": "The United Nations announced a major breakthrough in climate negotiations after seven years of stalled talks. Global leaders agreed on binding emission caps and an international fund to support green technology in developing countries.",
-        "Fake Preset: Cancer Secret": "A secret cure for cancer has been suppressed by major pharmaceutical companies, according to a whistleblower. The leak claims that inexpensive treatments have been hidden to protect corporate profits from ongoing therapy drugs."
-    }
-    
-    selected_preset = st.selectbox("Select sample to load:", list(presets.keys()))
-    preset_text = presets[selected_preset]
+    selected_preset = st.selectbox(
+        "Select sample to load:", 
+        list(presets.keys()),
+        key="selected_preset",
+        on_change=update_preset
+    )
     
     st.markdown("---")
     st.markdown("### 💡 Core Methodology")
@@ -347,23 +364,13 @@ with col_main:
     # Check if a preset is selected to populate the text area
     input_placeholder = "Paste the text of the article here to run verification analysis..."
     
-    # Use session state to handle text content cleanly
-    if "input_text" not in st.session_state:
-        st.session_state.input_text = ""
-        
-    if preset_text:
-        st.session_state.input_text = preset_text
-        
     user_input = st.text_area(
         "News Text", 
-        value=st.session_state.input_text, 
+        key="input_text", 
         placeholder=input_placeholder, 
         height=320, 
         label_visibility="collapsed"
     )
-    
-    # Sync text area back to session state
-    st.session_state.input_text = user_input
     
     col_btn_run, col_btn_clear = st.columns([4, 1])
     
@@ -371,9 +378,7 @@ with col_main:
         run_analysis = st.button("RUN NEURAL ANALYSIS 🚀")
         
     with col_btn_clear:
-        if st.button("RESET"):
-            st.session_state.input_text = ""
-            st.rerun()
+        st.button("RESET", on_click=reset_callback)
 
 # Processing and Output Visualization
 if run_analysis:
