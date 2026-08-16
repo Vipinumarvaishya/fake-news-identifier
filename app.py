@@ -4,6 +4,8 @@ import numpy as np
 import joblib
 import re
 import os
+import google.generativeai as genai
+import json
 
 # --- PAGE SETUP ---
 st.set_page_config(
@@ -157,6 +159,12 @@ st.markdown("""
         box-shadow: 0 0 30px rgba(255, 107, 107, 0.15);
         color: #FF6B6B;
     }
+    .mixed-news-card {
+        background: linear-gradient(135deg, rgba(255, 179, 64, 0.08) 0%, rgba(255, 179, 64, 0.02) 100%);
+        border: 1px solid rgba(255, 179, 64, 0.4);
+        box-shadow: 0 0 30px rgba(255, 179, 64, 0.15);
+        color: #FFB340;
+    }
     .result-badge {
         display: inline-block;
         font-size: 2.2rem;
@@ -195,6 +203,39 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# --- CLEANING PIPELINE ---
+def clean_text(text):
+    """Leak-free text preprocessing."""
+    if not isinstance(text, str):
+        return ""
+    
+    # 1. Remove Reuters publisher prefixes (e.g. "WASHINGTON (Reuters) - ")
+    text = re.sub(r'^[A-Z\s\.\,]+ \((Reuters|REUTERS)\) - ', '', text)
+    text = re.sub(r'^[A-Z\s\.\,]+ \((Reuters|REUTERS)\) -', '', text)
+    # Remove standard city/agency prefixes
+    text = re.sub(r'^[A-Z\s\.\,]+ - ', '', text)
+    text = re.sub(r'^[A-Z\s\.\,]+ -', '', text)
+    
+    # 2. Convert to lowercase
+    text = text.lower()
+    
+    # 3. Remove URLs
+    text = re.sub(r'https?://\S+|www\.\S+', '', text)
+    
+    # 4. Remove emails
+    text = re.sub(r'\S+@\S+', '', text)
+    
+    # 5. Remove HTML tags
+    text = re.sub(r'<[^>]*>', '', text)
+    
+    # 6. Remove non-alphabetic characters
+    text = re.sub(r'[^a-z\s]', '', text)
+    
+    # 7. Normalize spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
 # --- BACKEND MODEL LOADING ---
 @st.cache_resource
 def load_classifier_assets():
@@ -207,8 +248,7 @@ def load_classifier_assets():
         
     model = joblib.load(model_path)
     vectorizer = joblib.load(vec_path)
-    # The locally measured test accuracy
-    accuracy = 0.9935
+    accuracy = 0.9898 # The leak-free validation accuracy
     
     return model, vectorizer, accuracy
 
@@ -251,11 +291,11 @@ def analyze_text_metrics(text):
 
 def explain_prediction(text, model, vectorizer):
     """Identifies terms that influenced the decision towards Real vs Fake."""
-    # Clean text simple lower representation for vocabulary matching
-    clean_text = text.lower()
+    # Preprocess text
+    cleaned_input = clean_text(text)
     
     # Vectorize single input
-    tfidf_matrix = vectorizer.transform([clean_text])
+    tfidf_matrix = vectorizer.transform([cleaned_input])
     feature_names = vectorizer.get_feature_names_out()
     
     # Find active vocabulary words in input
@@ -288,6 +328,49 @@ def explain_prediction(text, model, vectorizer):
     
     return real_factors, fake_factors
 
+# --- GEMINI FACT-CHECKING LOGIC ---
+def gemini_fact_check(text, api_key):
+    """Uses Gemini 1.5 Flash API to analyze factual claims and logical consistency."""
+    if not api_key:
+        return {"error": "API Key is missing. Please enter your Gemini API Key in the sidebar."}
+        
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-3.5-flash')
+        
+        prompt = f"""
+You are an expert fact-checker and media intelligence analyst.
+Analyze the following news text and determine its factuality, bias, and credibility.
+
+Text to analyze:
+\"\"\"
+{text}
+\"\"\"
+
+Provide your response strictly in raw JSON format (do not wrap in markdown backticks or code blocks, output only the valid JSON string). The JSON must contain exactly these keys:
+- "verdict": "REAL", "FAKE", or "MIXED"
+- "confidence": an integer between 0 and 100
+- "accuracy_score": an integer between 0 and 100
+- "bias_score": an integer between 0 and 100 (where 0 is completely neutral, 100 is highly biased/partisan)
+- "summary": a 2-3 sentence overview of why this text is classified this way
+- "red_flags": a list of up to 4 warning flags found (e.g., "Sensationalist language", "Lack of checkable citations", "Out of context claims")
+- "verifiable_claims": a list of claims extracted from the text, with instructions on how to verify them or whether they are verified
+- "credibility_analysis": a brief evaluation of the text's overall logical structure and plausibility.
+"""
+        response = model.generate_content(prompt)
+        response_text = response.text.strip()
+        
+        # Clean potential markdown wrapping
+        if response_text.startswith("```json"):
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif response_text.startswith("```"):
+            response_text = response_text.split("```")[1].split("```")[0].strip()
+            
+        data = json.loads(response_text)
+        return data
+    except Exception as e:
+        return {"error": f"API Request Failed: {str(e)}"}
+
 # --- DATA PRESETS ---
 presets = {
     "None": "",
@@ -297,11 +380,13 @@ presets = {
     "Fake Preset: Cancer Secret": "A secret cure for cancer has been suppressed by major pharmaceutical companies, according to a whistleblower. The leak claims that inexpensive treatments have been hidden to protect corporate profits from ongoing therapy drugs."
 }
 
-# Initialize session state variables
+# --- STATE INITIALIZATION ---
 if "input_text" not in st.session_state:
     st.session_state.input_text = ""
 if "selected_preset" not in st.session_state:
     st.session_state.selected_preset = "None"
+if "gemini_api_key" not in st.session_state:
+    st.session_state.gemini_api_key = ""
 
 def update_preset():
     st.session_state.input_text = presets[st.session_state.selected_preset]
@@ -314,27 +399,27 @@ def reset_callback():
 with st.sidebar:
     st.markdown("### ⚙️ Engine Control Center")
     
-    # Model Status Card
-    st.markdown("""
-    <div style="background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 12px; padding: 15px; margin-bottom: 20px;">
-        <div style="display: flex; align-items: center; justify-content: space-between;">
-            <span style="color: #64748B; font-size: 0.85rem; font-weight: 600; text-transform: uppercase;">Engine Status</span>
-            <span style="background: rgba(0, 201, 167, 0.15); color: #00C9A7; font-size: 0.75rem; font-weight: bold; padding: 3px 8px; border-radius: 50px;">ONLINE</span>
-        </div>
-        <div style="margin-top: 15px;">
-            <div style="font-size: 0.8rem; color: #94A3B8; margin-bottom: 5px;">Model Classifier:</div>
-            <div style="font-weight: 600; color: #F1F5F9; font-size: 0.95rem;">Passive-Aggressive Classifier</div>
-        </div>
-        <div style="margin-top: 10px;">
-            <div style="font-size: 0.8rem; color: #94A3B8; margin-bottom: 5px;">Validation Accuracy:</div>
-            <div style="font-weight: 700; color: #845EC2; font-size: 1.1rem;">99.35%</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    # Engine Selection
+    selected_engine = st.radio(
+        "Choose Analysis Engine:",
+        ["Local ML Classifier", "Gemini AI Fact-Checker (Recommended)"],
+        index=1
+    )
     
+    # Gemini Key Input
+    if selected_engine == "Gemini AI Fact-Checker (Recommended)":
+        st.markdown("### 🔑 Gemini AI Credentials")
+        api_key = st.text_input(
+            "Google AI Studio API Key:",
+            type="password",
+            value=st.session_state.gemini_api_key,
+            key="gemini_api_key"
+        )
+        st.markdown("[Get free Gemini API Key](https://aistudio.google.com/)")
+    else:
+        api_key = ""
+
     st.markdown("### ⚡ Quick Presets")
-    st.markdown("Test the engine instantly using a preset sample:")
-    
     selected_preset = st.selectbox(
         "Select sample to load:", 
         list(presets.keys()),
@@ -344,24 +429,31 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("### 💡 Core Methodology")
-    st.markdown("""
-    This platform applies Natural Language Processing (NLP) representation to news authenticity analysis:
-    - **Feature Extraction**: TF-IDF (Term Frequency-Inverse Document Frequency) measures word occurrences relative to the dataset.
-    - **Classification**: Passive-Aggressive algorithms are highly effective for text streams and large dimensions.
-    """)
+    if selected_engine == "Local ML Classifier":
+        st.markdown("""
+        **Local ML Classifier**:
+        - Preprocesses input to strip publisher metadata, urls, and numbers.
+        - Applies TF-IDF representations.
+        - Leverages a Passive-Aggressive Classifier to catch stylistic markers of fake vs real news.
+        """)
+    else:
+        st.markdown("""
+        **Gemini AI Fact-Checker**:
+        - Cross-references claims against known world history and current news timelines.
+        - Evaluates logical flow, bias, fallacies, and sensationalist rhetoric.
+        - Highlights verifiable claims and source credibility.
+        """)
 
 # --- MAIN DASHBOARD INTERFACE ---
 # App Header
 st.markdown('<h1 class="glow-title">📰 Neural News Verification Dashboard</h1>', unsafe_allow_html=True)
-st.markdown('<p class="subtitle">Advanced Machine Learning Engine to classify news articles and explain prediction outcomes.</p>', unsafe_allow_html=True)
+st.markdown('<p class="subtitle">Advanced Machine Learning & Generative AI Fact-checking Engines to classify news authenticity.</p>', unsafe_allow_html=True)
 
 # Layout Setup
 col_main, col_spacer, col_metrics = st.columns([12, 1, 6])
 
 with col_main:
     st.markdown("### ✍️ Input News Article")
-    
-    # Check if a preset is selected to populate the text area
     input_placeholder = "Paste the text of the article here to run verification analysis..."
     
     user_input = st.text_area(
@@ -385,80 +477,200 @@ if run_analysis:
     if not user_input.strip():
         st.warning("⚠️ Please provide news content to begin prediction.")
     else:
-        # Calculate stats
+        # Calculate base metrics
         metrics = analyze_text_metrics(user_input)
         
-        # Make predictions
-        input_vec = tfidf.transform([user_input])
-        prediction = classifier.predict(input_vec)[0]
-        decision_score = classifier.decision_function(input_vec)[0]
-        
-        # Get explainable AI terms
-        real_words, fake_words = explain_prediction(user_input, classifier, tfidf)
-        
-        with col_main:
-            st.markdown("<br>", unsafe_allow_html=True)
-            st.markdown("### 📊 Verification Analysis Output")
+        # 1. Local ML Classifier Path
+        if selected_engine == "Local ML Classifier":
+            # Clean and predict
+            cleaned_input = clean_text(user_input)
+            input_vec = tfidf.transform([cleaned_input])
+            prediction = classifier.predict(input_vec)[0]
+            decision_score = classifier.decision_function(input_vec)[0]
             
-            # Prediction alert card
-            if prediction == 1:
-                st.markdown(f"""
-                <div class="result-alert real-news-card">
-                    <span style="font-size: 1.1rem; text-transform: uppercase; font-weight: bold; opacity: 0.85;">Analysis Result</span><br>
-                    <span class="result-badge">✓ VERIFIED AUTHENTIC</span><br>
-                    <p style="font-size: 1.05rem; margin-top: 10px; opacity: 0.9;">
-                        The document matches the linguistic profile of standard factual journalism. 
-                        Decision score confidence: <b>{decision_score:.3f}</b>
-                    </p>
-                </div>
-                """, unsafe_allow_html=True)
+            # Get explainable AI terms
+            real_words, fake_words = explain_prediction(user_input, classifier, tfidf)
+            
+            with col_main:
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.markdown("### 📊 Verification Analysis Output")
+                
+                # Prediction alert card
+                if prediction == 1:
+                    st.markdown(f"""
+                    <div class="result-alert real-news-card">
+                        <span style="font-size: 1.1rem; text-transform: uppercase; font-weight: bold; opacity: 0.85;">Local ML Result</span><br>
+                        <span class="result-badge">✓ VERIFIED AUTHENTIC</span><br>
+                        <p style="font-size: 1.05rem; margin-top: 10px; opacity: 0.9;">
+                            The document matches the linguistic profile of standard factual journalism. 
+                            Linguistic style score: <b>{decision_score:.3f}</b>
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                    <div class="result-alert fake-news-card">
+                        <span style="font-size: 1.1rem; text-transform: uppercase; font-weight: bold; opacity: 0.85;">Local ML Result</span><br>
+                        <span class="result-badge">🚨 FABRICATED / FAKE</span><br>
+                        <p style="font-size: 1.05rem; margin-top: 10px; opacity: 0.9;">
+                            The model detected vocabulary profiles typical of sensationalist or synthetic fake news.
+                            Linguistic style deviation: <b>{decision_score:.3f}</b>
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            # Display explainable AI metrics in the side column
+            with col_metrics:
+                st.markdown("### 🔍 Explainable AI Diagnostics")
+                st.markdown("Keywords contributing most heavily to the model classification:")
+                
+                exp_col_real, exp_col_fake = st.columns(2)
+                
+                with exp_col_real:
+                    st.markdown("<p style='color: #00C9A7; font-weight: 600; font-size: 0.9rem;'>REAL News Indicators</p>", unsafe_allow_html=True)
+                    if real_words:
+                        for r in real_words:
+                            st.markdown(f"""
+                            <div class="explain-tag real-tag">
+                                <span>{r['word']}</span>
+                                <span>+{r['score']:.2f}</span>
+                            </div>
+                            """, unsafe_allow_html=True)
+                    else:
+                        st.caption("No positive markers found.")
+                        
+                with exp_col_fake:
+                    st.markdown("<p style='color: #FF6B6B; font-weight: 600; font-size: 0.9rem;'>FAKE News Indicators</p>", unsafe_allow_html=True)
+                    if fake_words:
+                        for f in fake_words:
+                            st.markdown(f"""
+                            <div class="explain-tag fake-tag">
+                                <span>{f['word']}</span>
+                                <span>{f['score']:.2f}</span>
+                            </div>
+                            """, unsafe_allow_html=True)
+                    else:
+                        st.caption("No negative markers found.")
+
+        # 2. Gemini Fact-Checker Path
+        else:
+            with st.spinner("Initiating Gemini AI Fact-Checking Engine..."):
+                result = gemini_fact_check(user_input, api_key)
+                
+            if "error" in result:
+                st.error(f"❌ {result['error']}")
             else:
-                st.markdown(f"""
-                <div class="result-alert fake-news-card">
-                    <span style="font-size: 1.1rem; text-transform: uppercase; font-weight: bold; opacity: 0.85;">Analysis Result</span><br>
-                    <span class="result-badge">🚨 FABRICATED / FAKE</span><br>
-                    <p style="font-size: 1.05rem; margin-top: 10px; opacity: 0.9;">
-                        The model detected vocabulary profiles typical of sensationalist or synthetic fake news.
-                        Decision score deviation: <b>{decision_score:.3f}</b>
-                    </p>
-                </div>
-                """, unsafe_allow_html=True)
-        
-        # Display explainable AI metrics in the side column
-        with col_metrics:
-            st.markdown("### 🔍 Explainable AI Diagnostics")
-            st.markdown("Keywords contributing most heavily to the model classification:")
-            
-            exp_col_real, exp_col_fake = st.columns(2)
-            
-            with exp_col_real:
-                st.markdown("<p style='color: #00C9A7; font-weight: 600; font-size: 0.9rem;'>REAL News Indicators</p>", unsafe_allow_html=True)
-                if real_words:
-                    for r in real_words:
-                        st.markdown(f"""
-                        <div class="explain-tag real-tag">
-                            <span>{r['word']}</span>
-                            <span>+{r['score']:.2f}</span>
-                        </div>
-                        """, unsafe_allow_html=True)
-                else:
-                    st.caption("No positive markers found.")
+                verdict = result.get("verdict", "MIXED")
+                confidence = result.get("confidence", 0)
+                accuracy = result.get("accuracy_score", 0)
+                bias = result.get("bias_score", 0)
+                summary = result.get("summary", "")
+                red_flags = result.get("red_flags", [])
+                claims = result.get("verifiable_claims", [])
+                analysis = result.get("credibility_analysis", "")
+                
+                with col_main:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    st.markdown("### 📊 Verification Analysis Output")
                     
-            with exp_col_fake:
-                st.markdown("<p style='color: #FF6B6B; font-weight: 600; font-size: 0.9rem;'>FAKE News Indicators</p>", unsafe_allow_html=True)
-                if fake_words:
-                    for f in fake_words:
+                    if verdict == "REAL":
                         st.markdown(f"""
-                        <div class="explain-tag fake-tag">
-                            <span>{f['word']}</span>
-                            <span>{f['score']:.2f}</span>
+                        <div class="result-alert real-news-card">
+                            <span style="font-size: 1.1rem; text-transform: uppercase; font-weight: bold; opacity: 0.85;">Gemini AI Verdict</span><br>
+                            <span class="result-badge">✓ FACTUAL / REAL</span><br>
+                            <p style="font-size: 1.05rem; margin-top: 10px; opacity: 0.9;">
+                                {analysis}
+                            </p>
                         </div>
                         """, unsafe_allow_html=True)
-                else:
-                    st.caption("No negative markers found.")
-            
+                    elif verdict == "FAKE":
+                        st.markdown(f"""
+                        <div class="result-alert fake-news-card">
+                            <span style="font-size: 1.1rem; text-transform: uppercase; font-weight: bold; opacity: 0.85;">Gemini AI Verdict</span><br>
+                            <span class="result-badge">🚨 FABRICATED / FAKE</span><br>
+                            <p style="font-size: 1.05rem; margin-top: 10px; opacity: 0.9;">
+                                {analysis}
+                            </p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""
+                        <div class="result-alert mixed-news-card">
+                            <span style="font-size: 1.1rem; text-transform: uppercase; font-weight: bold; opacity: 0.85;">Gemini AI Verdict</span><br>
+                            <span class="result-badge">⚠ MIXED / UNVERIFIED</span><br>
+                            <p style="font-size: 1.05rem; margin-top: 10px; opacity: 0.9;">
+                                {analysis}
+                            </p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    st.markdown("### 📝 Fact-Check Overview & Verdict Summary")
+                    st.write(summary)
+                    
+                    if claims:
+                        st.markdown("### 🔍 Verifiable Claims Checklist")
+                        for claim in claims:
+                            st.markdown(f"- **Claim**: {claim}")
+
+                with col_metrics:
+                    st.markdown("### 📈 Fact-Checking Diagnostics")
+                    
+                    # Factual Accuracy progress bar
+                    st.markdown(f"""
+                    <div style="margin-bottom: 20px;">
+                        <div style="display: flex; justify-content: space-between; font-size: 0.9rem; margin-bottom: 5px;">
+                            <span style="color: #94A3B8;">Factual Accuracy</span>
+                            <span style="color: #F1F5F9; font-weight: 600;">{accuracy}%</span>
+                        </div>
+                        <div style="background: rgba(255, 255, 255, 0.05); height: 8px; border-radius: 4px; overflow: hidden;">
+                            <div style="background: linear-gradient(90deg, #00C9A7, #845EC2); width: {accuracy}%; height: 100%; border-radius: 4px;"></div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Bias Score progress bar
+                    st.markdown(f"""
+                    <div style="margin-bottom: 20px;">
+                        <div style="display: flex; justify-content: space-between; font-size: 0.9rem; margin-bottom: 5px;">
+                            <span style="color: #94A3B8;">Partisan Bias / Sensationalism</span>
+                            <span style="color: #F1F5F9; font-weight: 600;">{bias}%</span>
+                        </div>
+                        <div style="background: rgba(255, 255, 255, 0.05); height: 8px; border-radius: 4px; overflow: hidden;">
+                            <div style="background: linear-gradient(90deg, #845EC2, #FF6B6B); width: {bias}%; height: 100%; border-radius: 4px;"></div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Confidence Score progress bar
+                    st.markdown(f"""
+                    <div style="margin-bottom: 25px;">
+                        <div style="display: flex; justify-content: space-between; font-size: 0.9rem; margin-bottom: 5px;">
+                            <span style="color: #94A3B8;">Model Evaluation Confidence</span>
+                            <span style="color: #F1F5F9; font-weight: 600;">{confidence}%</span>
+                        </div>
+                        <div style="background: rgba(255, 255, 255, 0.05); height: 8px; border-radius: 4px; overflow: hidden;">
+                            <div style="background: linear-gradient(90deg, #845EC2, #D65DB1); width: {confidence}%; height: 100%; border-radius: 4px;"></div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    st.markdown("### 🚨 Credibility Warnings")
+                    if red_flags:
+                        for flag in red_flags:
+                            st.markdown(f"""
+                            <div class="explain-tag fake-tag" style="justify-content: flex-start; gap: 8px;">
+                                <span>⚠️</span>
+                                <span>{flag}</span>
+                            </div>
+                            """, unsafe_allow_html=True)
+                    else:
+                        st.success("No logical fallacies or credibility warning flags detected.")
+
+        # Bottom section: common text metrics
+        with col_metrics:
             st.markdown("<br>", unsafe_allow_html=True)
-            st.markdown("### 📈 Text Complexity Metrics")
+            st.markdown("### 📊 Text Complexity Metrics")
             
             # Metrics grid
             m_row1_col1, m_row1_col2 = st.columns(2)
