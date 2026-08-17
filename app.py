@@ -386,7 +386,28 @@ if "input_text" not in st.session_state:
 if "selected_preset" not in st.session_state:
     st.session_state.selected_preset = "None"
 if "gemini_api_key" not in st.session_state:
-    st.session_state.gemini_api_key = ""
+    # Auto-load Gemini API key from various potential sources
+    api_key = ""
+    # 1. Streamlit secrets
+    if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    # 2. Environment variables
+    elif os.environ.get("GEMINI_API_KEY"):
+        api_key = os.environ.get("GEMINI_API_KEY")
+    # 3. Local .env file
+    elif os.path.exists(".env"):
+        try:
+            with open(".env", "r") as f:
+                for line in f:
+                    line_str = line.strip()
+                    if line_str and not line_str.startswith("#") and "=" in line_str:
+                        k, v = line_str.split("=", 1)
+                        if k.strip() == "GEMINI_API_KEY":
+                            api_key = v.strip().strip('"').strip("'")
+                            break
+        except Exception:
+            pass
+    st.session_state.gemini_api_key = api_key
 
 def update_preset():
     st.session_state.input_text = presets[st.session_state.selected_preset]

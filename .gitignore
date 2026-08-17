@@ -1,0 +1,15 @@
+# Credentials and secrets
+.env
+.streamlit/secrets.toml
+
+# Python virtual environments and caches
+__pycache__/
+*.pyc
+venv/
+.venv/
+env/
+.env/
+
+# IDE files
+.vscode/
+.idea/

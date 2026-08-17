@@ -83,8 +83,6 @@ Made with ❤️ by Rimjhim Mishra
 ```
 
 🤝 Contributing
-Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
-<<<<<<< HEAD
 
-=======
->>>>>>> 7298a17 (your update message)
+Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
+
