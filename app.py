@@ -4,7 +4,7 @@ import numpy as np
 import joblib
 import re
 import os
-import google.generativeai as genai
+import requests
 import json
 
 # --- PAGE SETUP ---
@@ -324,19 +324,21 @@ def explain_prediction(text, model, vectorizer):
     word_impact = sorted(word_impact, key=lambda x: abs(x["score"]), reverse=True)
     
     real_factors = [w for w in word_impact if w["score"] > 0][:5]
-    fake_factors = [w for w in word_impact if w["score"] < 0][:5]
-    
     return real_factors, fake_factors
 
-# --- GEMINI FACT-CHECKING LOGIC ---
-def gemini_fact_check(text, api_key):
-    """Uses Gemini 1.5 Flash API to analyze factual claims and logical consistency."""
+# --- OPENROUTER FACT-CHECKING LOGIC ---
+def openrouter_fact_check(text, api_key, model_name="google/gemini-2.5-flash"):
+    """Uses OpenRouter API to analyze factual claims and logical consistency."""
     if not api_key:
-        return {"error": "API Key is missing. Please enter your Gemini API Key in the sidebar."}
+        return {"error": "API Key is missing. Please enter your OpenRouter API Key in the sidebar."}
         
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-3.5-flash')
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/Vipinumarvaishya/fake-news-identifier",
+            "X-Title": "Neural News Verification Dashboard"
+        }
         
         prompt = f"""
 You are an expert fact-checker and media intelligence analyst.
@@ -357,8 +359,24 @@ Provide your response strictly in raw JSON format (do not wrap in markdown backt
 - "verifiable_claims": a list of claims extracted from the text, with instructions on how to verify them or whether they are verified
 - "credibility_analysis": a brief evaluation of the text's overall logical structure and plausibility.
 """
-        response = model.generate_content(prompt)
-        response_text = response.text.strip()
+        
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ]
+        }
+        
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        response.raise_for_status()
+        result_json = response.json()
+        
+        response_text = result_json["choices"][0]["message"]["content"].strip()
         
         # Clean potential markdown wrapping
         if response_text.startswith("```json"):
@@ -369,7 +387,7 @@ Provide your response strictly in raw JSON format (do not wrap in markdown backt
         data = json.loads(response_text)
         return data
     except Exception as e:
-        return {"error": f"API Request Failed: {str(e)}"}
+        return {"error": f"OpenRouter API Request Failed: {str(e)}"}
 
 # --- DATA PRESETS ---
 presets = {
@@ -385,16 +403,41 @@ if "input_text" not in st.session_state:
     st.session_state.input_text = ""
 if "selected_preset" not in st.session_state:
     st.session_state.selected_preset = "None"
-if "gemini_api_key" not in st.session_state:
-    # Auto-load Gemini API key from various potential sources
+if "openrouter_api_key" not in st.session_state:
+    # Auto-load OpenRouter API key from various potential sources
     api_key = ""
-    # 1. Streamlit secrets
-    if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
-        api_key = st.secrets["GEMINI_API_KEY"]
+    # 1. Streamlit secrets (for Cloud deployment)
+    try:
+        if "OPENROUTER_API_KEY" in st.secrets:
+            api_key = st.secrets["OPENROUTER_API_KEY"]
+    except Exception:
+        # Streamlit raises StreamlitSecretNotFoundError if no secrets file exists locally
+        pass
+
     # 2. Environment variables
-    elif os.environ.get("GEMINI_API_KEY"):
-        api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key and os.environ.get("OPENROUTER_API_KEY"):
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+
     # 3. Local .env file
+    if not api_key and os.path.exists(".env"):
+        try:
+            with open(".env", "r") as f:
+                for line in f:
+                    line_str = line.strip()
+                    if line_str and not line_str.startswith("#") and "=" in line_str:
+                        k, v = line_str.split("=", 1)
+                        if k.strip() == "OPENROUTER_API_KEY":
+                            api_key = v.strip().strip('"').strip("'")
+                            break
+        except Exception:
+            pass
+    st.session_state.openrouter_api_key = api_key
+
+if "openrouter_model" not in st.session_state:
+    # Default model configuration
+    model_name = "google/gemini-2.5-flash"
+    if os.environ.get("OPENROUTER_MODEL"):
+        model_name = os.environ.get("OPENROUTER_MODEL")
     elif os.path.exists(".env"):
         try:
             with open(".env", "r") as f:
@@ -402,12 +445,12 @@ if "gemini_api_key" not in st.session_state:
                     line_str = line.strip()
                     if line_str and not line_str.startswith("#") and "=" in line_str:
                         k, v = line_str.split("=", 1)
-                        if k.strip() == "GEMINI_API_KEY":
-                            api_key = v.strip().strip('"').strip("'")
+                        if k.strip() == "OPENROUTER_MODEL":
+                            model_name = v.strip().strip('"').strip("'")
                             break
         except Exception:
             pass
-    st.session_state.gemini_api_key = api_key
+    st.session_state.openrouter_model = model_name
 
 def update_preset():
     st.session_state.input_text = presets[st.session_state.selected_preset]
@@ -423,22 +466,28 @@ with st.sidebar:
     # Engine Selection
     selected_engine = st.radio(
         "Choose Analysis Engine:",
-        ["Local ML Classifier", "Gemini AI Fact-Checker (Recommended)"],
+        ["Local ML Classifier", "OpenRouter AI Fact-Checker (Recommended)"],
         index=1
     )
     
-    # Gemini Key Input
-    if selected_engine == "Gemini AI Fact-Checker (Recommended)":
-        st.markdown("### 🔑 Gemini AI Credentials")
+    # OpenRouter Credentials Input
+    if selected_engine == "OpenRouter AI Fact-Checker (Recommended)":
+        st.markdown("### 🔑 OpenRouter Credentials")
         api_key = st.text_input(
-            "Google AI Studio API Key:",
+            "OpenRouter API Key:",
             type="password",
-            value=st.session_state.gemini_api_key,
-            key="gemini_api_key"
+            value=st.session_state.openrouter_api_key,
+            key="openrouter_api_key"
         )
-        st.markdown("[Get free Gemini API Key](https://aistudio.google.com/)")
+        model_name = st.text_input(
+            "OpenRouter Model:",
+            value=st.session_state.openrouter_model,
+            key="openrouter_model"
+        )
+        st.markdown("[Get OpenRouter API Key](https://openrouter.ai/)")
     else:
         api_key = ""
+        model_name = ""
 
     st.markdown("### ⚡ Quick Presets")
     selected_preset = st.selectbox(
@@ -459,7 +508,8 @@ with st.sidebar:
         """)
     else:
         st.markdown("""
-        **Gemini AI Fact-Checker**:
+        **OpenRouter AI Fact-Checker**:
+        - Leverages state-of-the-art Large Language Models (like Gemini, Claude, or LLaMA) via OpenRouter.
         - Cross-references claims against known world history and current news timelines.
         - Evaluates logical flow, bias, fallacies, and sensationalist rhetoric.
         - Highlights verifiable claims and source credibility.
@@ -573,10 +623,10 @@ if run_analysis:
                     else:
                         st.caption("No negative markers found.")
 
-        # 2. Gemini Fact-Checker Path
+        # 2. OpenRouter Fact-Checker Path
         else:
-            with st.spinner("Initiating Gemini AI Fact-Checking Engine..."):
-                result = gemini_fact_check(user_input, api_key)
+            with st.spinner(f"Initiating OpenRouter AI Fact-Checking Engine ({model_name})..."):
+                result = openrouter_fact_check(user_input, api_key, model_name)
                 
             if "error" in result:
                 st.error(f"❌ {result['error']}")
@@ -597,7 +647,7 @@ if run_analysis:
                     if verdict == "REAL":
                         st.markdown(f"""
                         <div class="result-alert real-news-card">
-                            <span style="font-size: 1.1rem; text-transform: uppercase; font-weight: bold; opacity: 0.85;">Gemini AI Verdict</span><br>
+                            <span style="font-size: 1.1rem; text-transform: uppercase; font-weight: bold; opacity: 0.85;">OpenRouter AI Verdict</span><br>
                             <span class="result-badge">✓ FACTUAL / REAL</span><br>
                             <p style="font-size: 1.05rem; margin-top: 10px; opacity: 0.9;">
                                 {analysis}
@@ -607,7 +657,7 @@ if run_analysis:
                     elif verdict == "FAKE":
                         st.markdown(f"""
                         <div class="result-alert fake-news-card">
-                            <span style="font-size: 1.1rem; text-transform: uppercase; font-weight: bold; opacity: 0.85;">Gemini AI Verdict</span><br>
+                            <span style="font-size: 1.1rem; text-transform: uppercase; font-weight: bold; opacity: 0.85;">OpenRouter AI Verdict</span><br>
                             <span class="result-badge">🚨 FABRICATED / FAKE</span><br>
                             <p style="font-size: 1.05rem; margin-top: 10px; opacity: 0.9;">
                                 {analysis}
@@ -617,7 +667,7 @@ if run_analysis:
                     else:
                         st.markdown(f"""
                         <div class="result-alert mixed-news-card">
-                            <span style="font-size: 1.1rem; text-transform: uppercase; font-weight: bold; opacity: 0.85;">Gemini AI Verdict</span><br>
+                            <span style="font-size: 1.1rem; text-transform: uppercase; font-weight: bold; opacity: 0.85;">OpenRouter AI Verdict</span><br>
                             <span class="result-badge">⚠ MIXED / UNVERIFIED</span><br>
                             <p style="font-size: 1.05rem; margin-top: 10px; opacity: 0.9;">
                                 {analysis}
